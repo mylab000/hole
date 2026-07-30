@@ -520,6 +520,17 @@
     return c.category === 'akpk' || c.category === 'penting';
   }
 
+  // A commitment counted here as "sudah dibayar guna pinjaman" if some active loan's
+  // usedFor points directly at it. That loan's own monthly payment already represents
+  // the ongoing cash obligation, so the commitment itself must not also be counted —
+  // otherwise the same debt gets deducted twice from today's cash balance.
+  function commitmentFundedLoan(commitId) {
+    return state.loans.find(l => !l.settled && l.usedFor === ('commit:' + commitId)) || null;
+  }
+  function isCommitmentFundedByLoan(c) {
+    return !!commitmentFundedLoan(c.id);
+  }
+
   // ==================== RENDER: SUMMARY TAB ====================
   function renderSummaryTab() {
     const activeLoans = state.loans.filter(l => !l.settled);
@@ -528,10 +539,15 @@
     const criticalLoans = activeLoans.filter(l => loanStatus(l) === 'overdue2');
     const warnLoans = activeLoans.filter(l => loanStatus(l) === 'overdue1');
 
-    const pentingCommits = state.commitments.filter(c => isCommitmentMandatory(c) && !state.deferredIds.includes(c.id));
+    const pentingCommits = state.commitments.filter(c => isCommitmentMandatory(c) && !state.deferredIds.includes(c.id) && !isCommitmentFundedByLoan(c));
     const totalPentingCommits = pentingCommits.reduce((s, c) => s + (c.amount || 0), 0);
     const totalMonthlyObligation = totalPentingCommits + activeLoans.reduce((s, l) => s + (l.monthlyPayment || 0), 0);
     const balance = (state.monthlyIncome || 0) - totalMonthlyObligation;
+
+    // Commitments already settled via a linked loan — shown separately so it's clear why
+    // they no longer appear in the cash-based totals above.
+    const loanFundedCommits = state.commitments.filter(c => isCommitmentMandatory(c) && !state.deferredIds.includes(c.id) && isCommitmentFundedByLoan(c));
+    const totalLoanFundedCommits = loanFundedCommits.reduce((s, c) => s + (c.amount || 0), 0);
 
     // "Gali lubang tutup lubang" tracking: how much of all loan principal ever taken
     // was used to pay off other debts/commitments, rather than genuine expenses.
@@ -565,6 +581,11 @@
         } else {
           html += `Baki semasa mencukupi untuk wajib bayar bulan ini (${fmt(totalMonthlyObligation)}), berbaki <strong>${fmt(cashVsObligation)}</strong> selepas itu.`;
         }
+        html += '</div>';
+      }
+      if (totalLoanFundedCommits > 0) {
+        html += '<div class="cash-balance-vs">';
+        html += `🔁 ${loanFundedCommits.length} komitmen (${fmt(totalLoanFundedCommits)}) sudah <strong>dibayar guna duit pinjaman</strong> — bayaran balik untuk pinjaman berkaitan sudah dikira di atas, jadi jumlah ini tidak ditolak lagi daripada baki tunai.`;
         html += '</div>';
       }
     }
@@ -612,6 +633,9 @@
     html += `<div class="summary-stat"><div class="n" style="color:var(--danger);">${fmt(totalLoss)}</div><div class="l">Jumlah kerugian (potongan) sepanjang masa</div></div>`;
     html += `<div class="summary-stat"><div class="n">${criticalLoans.length}</div><div class="l">Pinjaman kritikal (2 bulan+)</div></div>`;
     html += `<div class="summary-stat"><div class="n">${fmt(totalMonthlyObligation)}</div><div class="l">Wajib bayar bulan ini</div></div>`;
+    if (totalLoanFundedCommits > 0) {
+      html += `<div class="summary-stat"><div class="n">${fmt(totalLoanFundedCommits)}</div><div class="l">Dibayar guna pinjaman</div></div>`;
+    }
     html += '</div>';
     html += '</div>';
 
@@ -696,10 +720,21 @@
           html += `<span class="loan-due-text">Due dalam ${days} hari</span>`;
         }
         html += '<div class="loan-actions">';
+        html += `<button type="button" class="icon-btn-sm" onclick="toggleEditUsedFor('${l.id}')" title="Tanda guna untuk bayar komitmen/pinjaman lain">🔁</button>`;
         if (status !== 'settled') html += `<button type="button" class="icon-btn-sm" onclick="markLoanSettled('${l.id}')" title="Tanda selesai">✓</button>`;
         html += `<button type="button" class="icon-btn-sm" onclick="removeLoan('${l.id}')" title="Padam">✕</button>`;
         html += '</div>';
         html += '</div>';
+        if (editingUsedForLoanId === l.id) {
+          html += `<div class="delete-confirm-row" style="background:var(--accent-soft);">
+            <span>Duit pinjaman ini digunakan untuk bayar apa? Jika ia digunakan untuk bayar komitmen, komitmen berkenaan akan ditanda "sudah dibayar" secara automatik dan tidak akan ditolak lagi daripada baki wang hari ini.</span>
+            <div class="form-field" style="margin-bottom:0;">${buildUsedForSelectorInline(l.id, l.usedFor)}</div>
+            <div class="delete-confirm-btns">
+              <button type="button" class="btn-confirm-cancel" onclick="cancelEditUsedFor()">Batal</button>
+              <button type="button" class="btn-confirm-delete" style="background:var(--accent);" onclick="saveUsedFor('${l.id}')">Simpan</button>
+            </div>
+          </div>`;
+        }
         if (pendingDeleteLoanId === l.id) {
           html += `<div class="delete-confirm-row">
             <span>Padam "${escapeHtml(l.name)}"? Tindakan ini tidak boleh dibatalkan.</span>
@@ -800,9 +835,61 @@
   }
 
   let pendingDeleteLoanId = null;
+  let editingUsedForLoanId = null;
+
+  // Same options as buildUsedForSelector, but for editing an EXISTING loan: pre-selects
+  // the loan's current usedFor value and uses a per-loan element id (multiple loan cards
+  // can exist on screen at once).
+  function buildUsedForSelectorInline(loanId, currentValue) {
+    let html = `<select id="editUsedFor_${loanId}">`;
+    html += `<option value=""${!currentValue ? ' selected' : ''}>— Perbelanjaan lain (bukan untuk bayar hutang) —</option>`;
+    const otherLoans = state.loans.filter(l => l.id !== loanId && !l.settled);
+    if (otherLoans.length > 0) {
+      html += '<optgroup label="Bayar Pinjaman Lain">';
+      otherLoans.forEach(l => {
+        const val = 'loan:' + l.id;
+        html += `<option value="${val}"${currentValue === val ? ' selected' : ''}>${escapeHtml(l.name)} (${fmt(l.principal)})</option>`;
+      });
+      html += '</optgroup>';
+    }
+    if (state.commitments.length > 0) {
+      html += '<optgroup label="Bayar Komitmen">';
+      state.commitments.forEach(c => {
+        const val = 'commit:' + c.id;
+        html += `<option value="${val}"${currentValue === val ? ' selected' : ''}>${escapeHtml(c.name)} (${fmt(c.amount)})</option>`;
+      });
+      html += '</optgroup>';
+    }
+    html += '</select>';
+    return html;
+  }
+
+  function toggleEditUsedFor(id) {
+    editingUsedForLoanId = editingUsedForLoanId === id ? null : id;
+    pendingDeleteLoanId = null;
+    renderLoansTab();
+  }
+
+  function cancelEditUsedFor() {
+    editingUsedForLoanId = null;
+    renderLoansTab();
+  }
+
+  function saveUsedFor(id) {
+    const loan = state.loans.find(l => l.id === id);
+    const select = $('editUsedFor_' + id);
+    if (loan && select) {
+      loan.usedFor = select.value || null;
+    }
+    editingUsedForLoanId = null;
+    saveState();
+    renderLoansTab();
+    if (currentTab === 'summary') renderSummaryTab();
+  }
 
   function removeLoan(id) {
     pendingDeleteLoanId = id;
+    editingUsedForLoanId = null;
     renderLoansTab();
   }
 
@@ -843,13 +930,15 @@
       const sorted = state.commitments.slice().sort((a, b) => (categoryOrder[a.category] ?? 1) - (categoryOrder[b.category] ?? 1));
       sorted.forEach(c => {
         const isDeferred = state.deferredIds.includes(c.id);
+        const fundedLoan = commitmentFundedLoan(c.id);
         html += '<div>';
         html += '<div class="commit-row">';
         const tagLabel = c.category === 'akpk' ? 'AKPK' : (c.category === 'penting' ? 'PENTING' : 'BOLEH TANGGUH');
         html += `<span class="commit-tag ${c.category}">${tagLabel}</span>`;
         html += `<div class="commit-info ${isDeferred ? 'commit-deferred' : ''}">`;
         html += `<div class="commit-name">${escapeHtml(c.name)}</div>`;
-        if (isDeferred) html += '<div class="commit-status unpaid">Ditangguh bulan ini</div>';
+        if (fundedLoan) html += `<div class="commit-status paid">✓ Dibayar guna pinjaman: ${escapeHtml(fundedLoan.name)}</div>`;
+        else if (isDeferred) html += '<div class="commit-status unpaid">Ditangguh bulan ini</div>';
         html += '</div>';
         html += `<div class="commit-amount">${fmt(c.amount)}</div>`;
         html += `<button type="button" class="icon-btn-sm" onclick="removeCommitment('${c.id}')" title="Padam">✕</button>`;
@@ -916,8 +1005,8 @@
   function computeReschedulePlan() {
     const activeLoans = state.loans.filter(l => !l.settled);
     const loanMonthlyTotal = activeLoans.reduce((s, l) => s + (l.monthlyPayment || 0), 0);
-    const pentingTotal = state.commitments.filter(c => isCommitmentMandatory(c)).reduce((s, c) => s + c.amount, 0);
-    const tidakPentingCommits = state.commitments.filter(c => c.category === 'tidak-penting').sort((a, b) => b.amount - a.amount);
+    const pentingTotal = state.commitments.filter(c => isCommitmentMandatory(c) && !isCommitmentFundedByLoan(c)).reduce((s, c) => s + c.amount, 0);
+    const tidakPentingCommits = state.commitments.filter(c => c.category === 'tidak-penting' && !isCommitmentFundedByLoan(c)).sort((a, b) => b.amount - a.amount);
 
     const mandatoryTotal = loanMonthlyTotal + pentingTotal;
     const shortfall = mandatoryTotal - (state.monthlyIncome || 0);
