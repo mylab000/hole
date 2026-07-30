@@ -531,6 +531,34 @@
     return !!commitmentFundedLoan(c.id);
   }
 
+  // How much CASH is actually left in hand from a loan after it's used to pay a
+  // commitment — e.g. pinjam RM1300, guna RM100 bayar Astro, baki RM1200 masih duit
+  // sebenar yang ada di tangan. Only applies when usedFor points at a commitment;
+  // paying off another loan is just debt-shuffling, not new cash.
+  function loanCashInjection(loan) {
+    if (!loan.usedFor || loan.usedFor.indexOf('commit:') !== 0) return 0;
+    const commitId = loan.usedFor.slice('commit:'.length);
+    const commit = state.commitments.find(c => c.id === commitId);
+    if (!commit) return 0;
+    return Math.max(0, (loan.received || 0) - (commit.amount || 0));
+  }
+
+  // Keeps Baki Wang Hari Ini in sync with a loan's current usedFor link: reverses
+  // whatever this loan previously injected, then applies the current amount — so
+  // editing/removing the link later corrects the cash balance automatically instead
+  // of leaving stale amounts behind. Returns the net change applied (+ve/-ve/0).
+  function applyCashInjectionForLoan(loan) {
+    const prev = loan.cashInjection || 0;
+    const next = loanCashInjection(loan);
+    const delta = next - prev;
+    if (delta !== 0) {
+      state.cashBalance = (state.cashBalance || 0) + delta;
+      state.cashBalanceUpdatedAt = Date.now();
+    }
+    loan.cashInjection = next;
+    return delta;
+  }
+
   // ==================== RENDER: SUMMARY TAB ====================
   function renderSummaryTab() {
     const activeLoans = state.loans.filter(l => !l.settled);
@@ -707,7 +735,11 @@
         html += '</div>';
         const usedForLabel = resolveUsedForLabel(l.usedFor);
         if (usedForLabel) {
-          html += `<div class="used-for-tag">🔁 Digunakan untuk bayar: <strong>${escapeHtml(usedForLabel)}</strong></div>`;
+          html += `<div class="used-for-tag">🔁 Digunakan untuk bayar: <strong>${escapeHtml(usedForLabel)}</strong>`;
+          if (l.cashInjection > 0) {
+            html += ` — baki lebihan <strong>${fmt(l.cashInjection)}</strong> sudah masuk Baki Wang Hari Ini`;
+          }
+          html += '</div>';
         }
         html += '<div class="loan-due-row">';
         if (status === 'settled') {
@@ -727,7 +759,7 @@
         html += '</div>';
         if (editingUsedForLoanId === l.id) {
           html += `<div class="delete-confirm-row" style="background:var(--accent-soft);">
-            <span>Duit pinjaman ini digunakan untuk bayar apa? Jika ia digunakan untuk bayar komitmen, komitmen berkenaan akan ditanda "sudah dibayar" secara automatik dan tidak akan ditolak lagi daripada baki wang hari ini.</span>
+            <span>Duit pinjaman ini digunakan untuk bayar apa? Jika untuk bayar komitmen, <strong>baki lebihan (diterima − jumlah komitmen)</strong> akan ditambah automatik ke Baki Wang Hari Ini, dan komitmen berkenaan akan ditanda "sudah dibayar".</span>
             <div class="form-field" style="margin-bottom:0;">${buildUsedForSelectorInline(l.id, l.usedFor)}</div>
             <div class="delete-confirm-btns">
               <button type="button" class="btn-confirm-cancel" onclick="cancelEditUsedFor()">Batal</button>
@@ -822,9 +854,14 @@
       alert('Sila isi sekurang-kurangnya nama, tarikh due, dan jumlah pinjaman.');
       return;
     }
-    state.loans.push({ id: uid(), name, dueDate, principal, received, monthlyPayment, usedFor, settled: false, createdAt: Date.now() });
+    const newLoan = { id: uid(), name, dueDate, principal, received, monthlyPayment, usedFor, settled: false, cashInjection: 0, createdAt: Date.now() };
+    state.loans.push(newLoan);
+    const delta = applyCashInjectionForLoan(newLoan);
     saveState();
     renderLoansTab();
+    if (delta > 0) {
+      alert(`Pinjaman disimpan. ${fmt(delta)} baki lebihan (selepas bayar komitmen) telah ditambah automatik ke Baki Wang Hari Ini.`);
+    }
   }
 
   function markLoanSettled(id) {
@@ -878,13 +915,20 @@
   function saveUsedFor(id) {
     const loan = state.loans.find(l => l.id === id);
     const select = $('editUsedFor_' + id);
+    let delta = 0;
     if (loan && select) {
       loan.usedFor = select.value || null;
+      delta = applyCashInjectionForLoan(loan);
     }
     editingUsedForLoanId = null;
     saveState();
     renderLoansTab();
     if (currentTab === 'summary') renderSummaryTab();
+    if (delta > 0) {
+      alert(`${fmt(delta)} baki lebihan pinjaman ini telah ditambah automatik ke Baki Wang Hari Ini.`);
+    } else if (delta < 0) {
+      alert(`Pautan ditukar/dibuang — ${fmt(Math.abs(delta))} telah ditolak balik daripada Baki Wang Hari Ini supaya kekal tepat.`);
+    }
   }
 
   function removeLoan(id) {
